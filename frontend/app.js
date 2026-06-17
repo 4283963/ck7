@@ -8,6 +8,7 @@ let state = {
     heatmapData: [],
     trajectoryLines: [],
     shipsInfo: [],
+    suspectShips: [],
     stats: null,
     meta: null,
     cleanedId: null,
@@ -431,15 +432,18 @@ async function processData() {
             state.heatmapData = data.heatmap_data;
             state.trajectoryLines = data.trajectory_lines;
             state.shipsInfo = data.ships_info;
+            state.suspectShips = data.suspect_ships || [];
             state.cleanedId = data.cleaned_id || null;
 
             updateStatsPanel(data.used_stream, data.file_size_mb);
             updateInfoCards();
             updateShipsTable();
+            updateSuspectTable();
             renderChart();
 
             $('statsPanel').classList.remove('hidden');
             $('shipsPanel').classList.remove('hidden');
+            $('suspectPanel').classList.remove('hidden');
 
             let statusMsg = `✅ 处理完成 · 删除 ${data.stats.removed_count} 个漂移点 (${data.stats.removal_rate.toFixed(2)}%) · ${state.heatmapData.length} 个海域格子`;
             if (data.used_stream) {
@@ -516,6 +520,40 @@ function updateShipsTable() {
             <td><span style="color:#${s.avg_speed > 20 ? 'ff9900' : s.avg_speed > 10 ? '70e0a0' : '90b0d0'}">${s.avg_speed.toFixed(1)}</span></td>
         </tr>
     `).join('');
+}
+
+function updateSuspectTable() {
+    const tbody = $('suspectTableBody');
+    const emptyTip = $('suspectEmpty');
+    const tableContainer = document.querySelector('.suspect-table-container');
+
+    if (!state.suspectShips || state.suspectShips.length === 0) {
+        tbody.innerHTML = '';
+        tableContainer.classList.add('hidden');
+        emptyTip.classList.remove('hidden');
+        return;
+    }
+
+    tableContainer.classList.remove('hidden');
+    emptyTip.classList.add('hidden');
+
+    tbody.innerHTML = state.suspectShips.map(s => {
+        const durationStr = s.duration_hours >= 1
+            ? `${s.duration_hours.toFixed(1)} 小时`
+            : `${(s.duration_hours * 60).toFixed(0)} 分钟`;
+
+        const startTime = s.start_time ? s.start_time.split(' ')[1].substring(0, 5) : '';
+        const endTime = s.end_time ? s.end_time.split(' ')[1].substring(0, 5) : '';
+
+        return `
+            <tr class="suspect-row">
+                <td><strong style="color:#ff6b6b">⚠️ ${s.call_sign}</strong></td>
+                <td><span style="color:#ffcc00;font-weight:bold">${durationStr}</span></td>
+                <td>${s.avg_lat.toFixed(3)}°, ${s.avg_lon.toFixed(3)}°</td>
+                <td>${startTime} ~ ${endTime}</td>
+            </tr>
+        `;
+    }).join('');
 }
 
 function downloadCleaned() {

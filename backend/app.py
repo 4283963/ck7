@@ -9,7 +9,8 @@ from werkzeug.utils import secure_filename
 from cleaner import clean_ais_data, get_cleaning_stats, clean_ais_data_stream
 from aggregator import (
     grid_aggregation, grid_aggregation_stream,
-    grid_to_heatmap_data, grid_to_trajectory_lines
+    grid_to_heatmap_data, grid_to_trajectory_lines,
+    detect_illegal_anchorage, detect_illegal_anchorage_stream
 )
 
 app = Flask(__name__, static_folder='../frontend', static_url_path='')
@@ -93,6 +94,12 @@ def generate_sample_data():
         {'lat': 29.0, 'lon': 121.5, 'dst_lat': 32.5, 'dst_lon': 122.0},
     ]
 
+    illegal_anchorage_ships = {
+        'BOAT005': {'lat': 30.50, 'lon': 121.45, 'duration_hours': 5.5},
+        'BOAT010': {'lat': 30.20, 'lon': 121.80, 'duration_hours': 4.0},
+        'BOAT012': {'lat': 31.10, 'lon': 122.30, 'duration_hours': 6.5},
+    }
+
     records = []
     start_time = datetime(2025, 6, 1, 0, 0, 0)
 
@@ -121,6 +128,30 @@ def generate_sample_data():
                 'heading': round(np.random.uniform(0, 360), 1),
                 'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S')
             })
+
+        if call_sign in illegal_anchorage_ships:
+            anchor_info = illegal_anchorage_ships[call_sign]
+            duration = anchor_info['duration_hours']
+            num_anchor_points = int(duration * 4)
+
+            mid_idx = num_points // 2
+            anchor_lat = lats[mid_idx] + np.random.normal(0, 0.01)
+            anchor_lon = lons[mid_idx] + np.random.normal(0, 0.01)
+            anchor_start_time = base_time + timedelta(minutes=mid_idx * 15)
+
+            for i in range(num_anchor_points):
+                drift_lat = anchor_lat + np.random.normal(0, 0.002)
+                drift_lon = anchor_lon + np.random.normal(0, 0.002)
+                anchor_speed = np.random.uniform(0.1, 0.4)
+                ts = anchor_start_time + timedelta(minutes=i * 15)
+                records.append({
+                    'call_sign': call_sign,
+                    'latitude': round(drift_lat, 6),
+                    'longitude': round(drift_lon, 6),
+                    'speed': round(anchor_speed, 2),
+                    'heading': round(np.random.uniform(0, 360), 1),
+                    'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S')
+                })
 
         num_drift = np.random.randint(2, 6)
         for _ in range(num_drift):
@@ -242,6 +273,13 @@ def process_data():
             heatmap_data = grid_to_heatmap_data(point_count_list)
             trajectory_lines = grid_to_trajectory_lines(traj_list)
 
+            suspects = detect_illegal_anchorage_stream(
+                cleaned_path,
+                speed_threshold=0.5,
+                min_duration_hours=3.0,
+                chunksize=chunksize
+            )
+
             ships_info = [
                 {
                     'call_sign': s['call_sign'],
@@ -262,6 +300,7 @@ def process_data():
                 'heatmap_data': heatmap_data,
                 'trajectory_lines': trajectory_lines,
                 'ships_info': ships_info,
+                'suspect_ships': suspects,
                 'cleaned_id': cleaned_id,
                 'used_stream': True,
                 'file_size_mb': round(file_size_mb, 2)
@@ -279,6 +318,12 @@ def process_data():
 
             heatmap_data = grid_to_heatmap_data(point_count)
             trajectory_lines = grid_to_trajectory_lines(traj_density)
+
+            suspects = detect_illegal_anchorage(
+                cleaned_df,
+                speed_threshold=0.5,
+                min_duration_hours=3.0
+            )
 
             ships_info = []
             for _, row in ship_tracks.iterrows():
@@ -302,6 +347,7 @@ def process_data():
                 'heatmap_data': heatmap_data,
                 'trajectory_lines': trajectory_lines,
                 'ships_info': ships_info,
+                'suspect_ships': suspects,
                 'cleaned_id': cleaned_id,
                 'used_stream': False,
                 'file_size_mb': round(file_size_mb, 2)

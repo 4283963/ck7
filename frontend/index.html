@@ -140,6 +140,27 @@
                 </div>
             </div>
 
+            <div class="panel suspect-panel hidden" id="suspectPanel">
+                <h2>⚠️ 非法抛锚嫌疑船只</h2>
+                <p class="panel-desc">连续 3 小时以上航速低于 0.5 节，且不在已知港口/锚地内</p>
+                <div class="suspect-table-container">
+                    <table class="suspect-table">
+                        <thead>
+                            <tr>
+                                <th>船呼号</th>
+                                <th>停留时长</th>
+                                <th>平均位置</th>
+                                <th>时间范围</th>
+                            </tr>
+                        </thead>
+                        <tbody id="suspectTableBody"></tbody>
+                    </table>
+                </div>
+                <div id="suspectEmpty" class="empty-tip hidden">
+                    未发现有非法抛锚嫌疑的船舶
+                </div>
+            </div>
+
             <div class="panel ships-panel hidden" id="shipsPanel">
                 <h2>🚢 船舶列表</h2>
                 <div class="ships-table-container">

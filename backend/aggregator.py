@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+from harbors import is_in_any_harbor, haversine_km
 
 
 def grid_aggregation(df, lat_step=0.05, lon_step=0.05):
@@ -316,3 +317,238 @@ def grid_to_trajectory_lines(trajectory_density_df):
             lines.append(row)
 
     return lines
+
+
+def detect_illegal_anchorage(df, speed_threshold=0.5, min_duration_hours=3.0):
+    """
+    检测非法抛锚嫌疑船只。
+    条件：速度连续低于阈值，且位置不在已知港口/锚地内。
+
+    返回: list of dict, 每个元素包含
+        - call_sign: 船呼号
+        - duration_hours: 低速停留时长(小时)
+        - avg_lat: 平均纬度
+        - avg_lon: 平均经度
+        - start_time: 开始时间
+        - end_time: 结束时间
+        - avg_speed: 平均速度
+        - point_count: 数据点数
+    """
+    if df.empty:
+        return []
+
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.sort_values(['call_sign', 'timestamp']).reset_index(drop=True)
+
+    suspects = []
+
+    for call_sign, group in df.groupby('call_sign'):
+        group = group.sort_values('timestamp').reset_index(drop=True)
+
+        current_segment = None
+
+        for _, row in group.iterrows():
+            speed = float(row['speed'])
+            ts = row['timestamp']
+            lat = float(row['latitude'])
+            lon = float(row['longitude'])
+
+            if speed < speed_threshold:
+                if current_segment is None:
+                    current_segment = {
+                        'start_time': ts,
+                        'end_time': ts,
+                        'lat_sum': lat,
+                        'lon_sum': lon,
+                        'speed_sum': speed,
+                        'point_count': 1,
+                        'start_lat': lat,
+                        'start_lon': lon
+                    }
+                else:
+                    current_segment['end_time'] = ts
+                    current_segment['lat_sum'] += lat
+                    current_segment['lon_sum'] += lon
+                    current_segment['speed_sum'] += speed
+                    current_segment['point_count'] += 1
+            else:
+                if current_segment is not None:
+                    duration_hours = (current_segment['end_time'] - current_segment['start_time']).total_seconds() / 3600.0
+                    if duration_hours >= min_duration_hours:
+                        avg_lat = current_segment['lat_sum'] / current_segment['point_count']
+                        avg_lon = current_segment['lon_sum'] / current_segment['point_count']
+                        avg_speed = current_segment['speed_sum'] / current_segment['point_count']
+
+                        in_harbor, harbor = is_in_any_harbor(avg_lat, avg_lon)
+                        if not in_harbor:
+                            suspects.append({
+                                'call_sign': call_sign,
+                                'duration_hours': round(duration_hours, 2),
+                                'avg_lat': round(avg_lat, 6),
+                                'avg_lon': round(avg_lon, 6),
+                                'start_time': current_segment['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                                'end_time': current_segment['end_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                                'avg_speed': round(avg_speed, 2),
+                                'point_count': current_segment['point_count']
+                            })
+                    current_segment = None
+
+        if current_segment is not None:
+            duration_hours = (current_segment['end_time'] - current_segment['start_time']).total_seconds() / 3600.0
+            if duration_hours >= min_duration_hours:
+                avg_lat = current_segment['lat_sum'] / current_segment['point_count']
+                avg_lon = current_segment['lon_sum'] / current_segment['point_count']
+                avg_speed = current_segment['speed_sum'] / current_segment['point_count']
+
+                in_harbor, harbor = is_in_any_harbor(avg_lat, avg_lon)
+                if not in_harbor:
+                    suspects.append({
+                        'call_sign': call_sign,
+                        'duration_hours': round(duration_hours, 2),
+                        'avg_lat': round(avg_lat, 6),
+                        'avg_lon': round(avg_lon, 6),
+                        'start_time': current_segment['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                        'end_time': current_segment['end_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                        'avg_speed': round(avg_speed, 2),
+                        'point_count': current_segment['point_count']
+                    })
+
+    suspects.sort(key=lambda x: x['duration_hours'], reverse=True)
+    return suspects
+
+
+def detect_illegal_anchorage_stream(input_path, speed_threshold=0.5, min_duration_hours=3.0,
+                                    chunksize=100000, encoding='utf-8-sig'):
+    """
+    流式检测非法抛锚嫌疑船只。
+    使用字典维护每艘船的当前连续低速段状态，分块处理。
+
+    返回格式与 detect_illegal_anchorage 相同。
+    """
+    ship_states = {}
+
+    reader = pd.read_csv(input_path, encoding=encoding, chunksize=chunksize)
+
+    for chunk in reader:
+        chunk['timestamp'] = pd.to_datetime(chunk['timestamp'])
+        chunk['speed'] = pd.to_numeric(chunk['speed'], errors='coerce')
+        chunk['latitude'] = pd.to_numeric(chunk['latitude'], errors='coerce')
+        chunk['longitude'] = pd.to_numeric(chunk['longitude'], errors='coerce')
+        chunk = chunk.dropna(subset=['latitude', 'longitude', 'speed', 'call_sign', 'timestamp'])
+
+        if len(chunk) == 0:
+            continue
+
+        chunk = chunk.sort_values(['call_sign', 'timestamp']).reset_index(drop=True)
+
+        call_signs = chunk['call_sign'].values
+        timestamps = chunk['timestamp'].values
+        lats = chunk['latitude'].values
+        lons = chunk['longitude'].values
+        speeds = chunk['speed'].values
+
+        for i in range(len(chunk)):
+            cs = call_signs[i]
+            ts = timestamps[i]
+            lat = float(lats[i])
+            lon = float(lons[i])
+            sp = float(speeds[i])
+
+            if cs not in ship_states:
+                ship_states[cs] = {
+                    'current_segment': None,
+                    'completed_segments': [],
+                    'last_ts': None,
+                    'last_lat': None,
+                    'last_lon': None
+                }
+
+            state = ship_states[cs]
+
+            if sp < speed_threshold:
+                if state['current_segment'] is None:
+                    state['current_segment'] = {
+                        'start_time': pd.Timestamp(ts),
+                        'end_time': pd.Timestamp(ts),
+                        'lat_sum': lat,
+                        'lon_sum': lon,
+                        'speed_sum': sp,
+                        'point_count': 1
+                    }
+                else:
+                    seg = state['current_segment']
+                    seg['end_time'] = pd.Timestamp(ts)
+                    seg['lat_sum'] += lat
+                    seg['lon_sum'] += lon
+                    seg['speed_sum'] += sp
+                    seg['point_count'] += 1
+            else:
+                if state['current_segment'] is not None:
+                    seg = state['current_segment']
+                    duration_hours = (seg['end_time'] - seg['start_time']).total_seconds() / 3600.0
+                    if duration_hours >= min_duration_hours:
+                        avg_lat = seg['lat_sum'] / seg['point_count']
+                        avg_lon = seg['lon_sum'] / seg['point_count']
+                        avg_speed = seg['speed_sum'] / seg['point_count']
+
+                        in_harbor, _ = is_in_any_harbor(avg_lat, avg_lon)
+                        if not in_harbor:
+                            state['completed_segments'].append({
+                                'call_sign': cs,
+                                'duration_hours': duration_hours,
+                                'avg_lat': avg_lat,
+                                'avg_lon': avg_lon,
+                                'start_time': seg['start_time'],
+                                'end_time': seg['end_time'],
+                                'avg_speed': avg_speed,
+                                'point_count': seg['point_count']
+                            })
+                    state['current_segment'] = None
+
+            state['last_ts'] = ts
+            state['last_lat'] = lat
+            state['last_lon'] = lon
+
+    all_suspects = []
+
+    for cs, state in ship_states.items():
+        for seg in state['completed_segments']:
+            all_suspects.append(seg)
+
+        if state['current_segment'] is not None:
+            seg = state['current_segment']
+            duration_hours = (seg['end_time'] - seg['start_time']).total_seconds() / 3600.0
+            if duration_hours >= min_duration_hours:
+                avg_lat = seg['lat_sum'] / seg['point_count']
+                avg_lon = seg['lon_sum'] / seg['point_count']
+                avg_speed = seg['speed_sum'] / seg['point_count']
+
+                in_harbor, _ = is_in_any_harbor(avg_lat, avg_lon)
+                if not in_harbor:
+                    all_suspects.append({
+                        'call_sign': cs,
+                        'duration_hours': duration_hours,
+                        'avg_lat': avg_lat,
+                        'avg_lon': avg_lon,
+                        'start_time': seg['start_time'],
+                        'end_time': seg['end_time'],
+                        'avg_speed': avg_speed,
+                        'point_count': seg['point_count']
+                    })
+
+    result = []
+    for s in all_suspects:
+        result.append({
+            'call_sign': s['call_sign'],
+            'duration_hours': round(s['duration_hours'], 2),
+            'avg_lat': round(s['avg_lat'], 6),
+            'avg_lon': round(s['avg_lon'], 6),
+            'start_time': pd.Timestamp(s['start_time']).strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': pd.Timestamp(s['end_time']).strftime('%Y-%m-%d %H:%M:%S'),
+            'avg_speed': round(s['avg_speed'], 2),
+            'point_count': s['point_count']
+        })
+
+    result.sort(key=lambda x: x['duration_hours'], reverse=True)
+    return result
