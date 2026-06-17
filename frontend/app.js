@@ -1,5 +1,7 @@
 const API_BASE = '';
 
+const PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
+
 let state = {
     currentFile: null,
     useSample: false,
@@ -8,7 +10,7 @@ let state = {
     shipsInfo: [],
     stats: null,
     meta: null,
-    cleanedCsv: null,
+    cleanedId: null,
     chart: null
 };
 
@@ -26,7 +28,20 @@ function hideLoading() {
 function setStatus(msg, type = 'info') {
     const el = $('dataStatus');
     el.className = `status-box status-${type}`;
-    el.textContent = msg;
+    el.innerHTML = msg;
+}
+
+function showUploadProgress(percent, loadedMB, totalMB) {
+    const container = $('uploadProgressContainer');
+    const bar = $('uploadProgressBar');
+    const text = $('uploadProgressText');
+    container.classList.remove('hidden');
+    bar.style.width = percent + '%';
+    text.textContent = `上传中 ${percent.toFixed(1)}%  (${loadedMB.toFixed(1)} MB / ${totalMB.toFixed(1)} MB)`;
+}
+
+function hideUploadProgress() {
+    $('uploadProgressContainer').classList.add('hidden');
 }
 
 function initChart() {
@@ -247,7 +262,7 @@ function buildChartOption() {
             itemWidth: 12,
             itemHeight: 160,
             textStyle: { color: '#90b0d0' },
-            dimension: dimension === 'point_count' ? 2 : (dimension === 'ship_count' ? 2 : 2),
+            dimension: dimension === 'point_count' ? 2 : 2,
             inRange: {
                 color: [
                     '#003366',
@@ -281,7 +296,10 @@ async function generateSample() {
         if (data.success) {
             state.currentFile = data.filename;
             state.useSample = true;
-            setStatus(`✅ 示例数据就绪: ${data.record_count} 条记录 · ${data.ship_count} 艘船舶`, 'ok');
+            setStatus(
+                `✅ 示例数据就绪<br/><small>共 ${data.ship_count} 艘船舶 · 点击下方按钮开始处理</small>`,
+                'ok'
+            );
             $('btnProcess').disabled = false;
         } else {
             setStatus(`❌ ${data.error || '生成失败'}`, 'error');
@@ -293,34 +311,87 @@ async function generateSample() {
     }
 }
 
+function uploadFile(file) {
+    return new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const xhr = new XMLHttpRequest();
+
+        xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+                const percent = (e.loaded / e.total) * 100;
+                const loadedMB = e.loaded / (1024 * 1024);
+                const totalMB = e.total / (1024 * 1024);
+                showUploadProgress(percent, loadedMB, totalMB);
+            }
+        });
+
+        xhr.addEventListener('load', () => {
+            hideUploadProgress();
+            try {
+                const data = JSON.parse(xhr.responseText);
+                if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                    resolve(data);
+                } else {
+                    reject(new Error(data.error || `上传失败 (HTTP ${xhr.status})`));
+                }
+            } catch (e) {
+                reject(new Error(`响应解析失败: ${e.message}`));
+            }
+        });
+
+        xhr.addEventListener('error', () => {
+            hideUploadProgress();
+            reject(new Error('网络错误，上传失败'));
+        });
+
+        xhr.addEventListener('abort', () => {
+            hideUploadProgress();
+            reject(new Error('上传已取消'));
+        });
+
+        xhr.timeout = 600 * 1000;
+        xhr.addEventListener('timeout', () => {
+            hideUploadProgress();
+            reject(new Error('上传超时，请检查网络或使用较小的文件'));
+        });
+
+        xhr.open('POST', `${API_BASE}/api/upload`);
+        xhr.send(formData);
+    });
+}
+
 function handleFileUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
 
-    showLoading('正在上传并解析 CSV...');
-    const formData = new FormData();
-    formData.append('file', file);
+    const fileMB = file.size / (1024 * 1024);
+    setStatus(`📤 准备上传: ${file.name} (${fileMB.toFixed(2)} MB)...`, 'info');
 
-    fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData })
-        .then(r => r.json())
+    uploadFile(file)
         .then(data => {
-            hideLoading();
-            if (data.success) {
-                state.currentFile = data.filename;
-                state.useSample = false;
-                setStatus(
-                    `✅ 上传成功: ${data.filename} · ${data.record_count} 条记录 · 列: ${data.columns.join(', ')}`,
-                    'ok'
-                );
-                $('btnProcess').disabled = false;
-            } else {
-                setStatus(`❌ ${data.error || '上传失败'}`, 'error');
+            state.currentFile = data.filename;
+            state.useSample = false;
+
+            let msg = `✅ 上传成功<br/><small>`;
+            msg += `文件: ${data.filename}<br/>`;
+            msg += `大小: ${data.file_size_mb.toFixed(2)} MB<br/>`;
+            msg += `列: ${data.columns.join(', ')}`;
+            if (data.will_stream_process) {
+                msg += `<br/><span style="color:#ffcc00">⚠️ 大文件将使用流式处理（稍慢但内存安全）</span>`;
             }
+            msg += `</small>`;
+
+            setStatus(msg, 'ok');
+            $('btnProcess').disabled = false;
         })
-        .catch(e => {
-            hideLoading();
-            setStatus(`❌ 请求失败: ${e.message}`, 'error');
+        .catch(err => {
+            setStatus(`❌ ${err.message}`, 'error');
+            $('btnProcess').disabled = true;
         });
+
+    e.target.value = '';
 }
 
 async function processData() {
@@ -329,24 +400,30 @@ async function processData() {
         return;
     }
 
-    showLoading('正在执行数据清洗与海域聚合...');
+    showLoading('正在执行数据清洗与海域聚合...\n(大文件可能需要较长时间，请耐心等待)');
 
     const payload = {
         filename: state.currentFile,
         use_sample: state.useSample,
         max_speed: parseFloat($('maxSpeed').value),
         lat_step: parseFloat($('latStep').value),
-        lon_step: parseFloat($('lonStep').value)
+        lon_step: parseFloat($('lonStep').value),
+        chunksize: 100000
     };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), PROCESS_TIMEOUT_MS);
 
     try {
         const res = await fetch(`${API_BASE}/api/process`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: controller.signal
         });
+
+        clearTimeout(timeoutId);
         const data = await res.json();
-        hideLoading();
 
         if (data.success) {
             state.stats = data.stats;
@@ -354,9 +431,9 @@ async function processData() {
             state.heatmapData = data.heatmap_data;
             state.trajectoryLines = data.trajectory_lines;
             state.shipsInfo = data.ships_info;
-            state.cleanedCsv = data.cleaned_csv;
+            state.cleanedId = data.cleaned_id || null;
 
-            updateStatsPanel();
+            updateStatsPanel(data.used_stream, data.file_size_mb);
             updateInfoCards();
             updateShipsTable();
             renderChart();
@@ -364,20 +441,27 @@ async function processData() {
             $('statsPanel').classList.remove('hidden');
             $('shipsPanel').classList.remove('hidden');
 
-            setStatus(
-                `✅ 处理完成 · 删除 ${data.stats.removed_count} 个漂移点 (${data.stats.removal_rate.toFixed(2)}%) · ${state.heatmapData.length} 个海域格子`,
-                'ok'
-            );
+            let statusMsg = `✅ 处理完成 · 删除 ${data.stats.removed_count} 个漂移点 (${data.stats.removal_rate.toFixed(2)}%) · ${state.heatmapData.length} 个海域格子`;
+            if (data.used_stream) {
+                statusMsg += '<br/><small style="color:#7ed8ff">⚡ 使用流式处理模式</small>';
+            }
+            setStatus(statusMsg, 'ok');
         } else {
             setStatus(`❌ ${data.error || '处理失败'}`, 'error');
         }
     } catch (e) {
+        if (e.name === 'AbortError') {
+            setStatus('⏱️ 处理超时，文件可能过大。请尝试减小文件或使用更大的 chunksize。', 'error');
+        } else {
+            setStatus(`❌ 请求失败: ${e.message}`, 'error');
+        }
+    } finally {
+        clearTimeout(timeoutId);
         hideLoading();
-        setStatus(`❌ 请求失败: ${e.message}`, 'error');
     }
 }
 
-function updateStatsPanel() {
+function updateStatsPanel(usedStream, fileSizeMB) {
     const s = state.stats;
     $('statOriginal').textContent = s.original_count.toLocaleString();
     $('statCleaned').textContent = s.cleaned_count.toLocaleString();
@@ -385,6 +469,11 @@ function updateStatsPanel() {
     $('statRate').textContent = s.removal_rate.toFixed(2) + '%';
     $('statShipsOrig').textContent = s.ships_original;
     $('statShipsClean').textContent = s.ships_cleaned;
+
+    const btn = $('btnDownload');
+    if (state.cleanedId) {
+        btn.disabled = false;
+    }
 }
 
 function updateInfoCards() {
@@ -430,18 +519,12 @@ function updateShipsTable() {
 }
 
 function downloadCleaned() {
-    if (!state.cleanedCsv) {
+    if (!state.cleanedId) {
         alert('没有可下载的数据');
         return;
     }
-    const BOM = '\uFEFF';
-    const blob = new Blob([BOM + state.cleanedCsv], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'ais_cleaned.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    const url = `${API_BASE}/api/download-cleaned/${state.cleanedId}`;
+    window.open(url, '_blank');
 }
 
 function bindEvents() {
