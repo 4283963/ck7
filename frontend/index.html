@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIS 船舶轨迹清洗与航道拥堵热力图系统</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/extension/bmap.min.js"></script>
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <h1>🚢 AIS 船舶轨迹清洗与航道拥堵热力图系统</h1>
+            <p class="subtitle">海事局商船 AIS 原始轨迹数据 · 智能漂移点清洗 · 海域格子聚合 · 多维可视化</p>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <aside class="sidebar">
+            <div class="panel">
+                <h2>数据加载</h2>
+                <div class="btn-group">
+                    <button id="btnGenerateSample" class="btn btn-primary">
+                        📊 生成示例数据
+                    </button>
+                    <div class="divider">或</div>
+                    <label class="file-upload">
+                        <input type="file" id="fileInput" accept=".csv" hidden>
+                        <span class="btn btn-secondary">📁 上传 CSV 文件</span>
+                    </label>
+                </div>
+                <div id="dataStatus" class="status-box status-info">
+                    等待数据加载...
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>清洗参数</h2>
+                <div class="form-group">
+                    <label>最大合理航速（节）:</label>
+                    <input type="number" id="maxSpeed" value="50" min="10" max="200" step="5">
+                    <small>商船正常航速 10-30 节，集装箱船最高约 35 节</small>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>聚合参数</h2>
+                <div class="form-group">
+                    <label>纬度格子步长:</label>
+                    <input type="number" id="latStep" value="0.05" min="0.01" max="1" step="0.01">
+                </div>
+                <div class="form-group">
+                    <label>经度格子步长:</label>
+                    <input type="number" id="lonStep" value="0.05" min="0.01" max="1" step="0.01">
+                </div>
+                <small>步长越小，精度越高，计算越慢</small>
+            </div>
+
+            <div class="panel">
+                <div class="btn-group">
+                    <button id="btnProcess" class="btn btn-success btn-large" disabled>
+                        🔄 开始清洗与聚合
+                    </button>
+                </div>
+            </div>
+
+            <div id="statsPanel" class="panel hidden">
+                <h2>清洗统计</h2>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">原始点数</span>
+                        <span class="stat-value" id="statOriginal">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">清洗后</span>
+                        <span class="stat-value stat-ok" id="statCleaned">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">删除漂移点</span>
+                        <span class="stat-value stat-bad" id="statRemoved">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">删除比例</span>
+                        <span class="stat-value" id="statRate">0%</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">原始船舶数</span>
+                        <span class="stat-value" id="statShipsOrig">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">清洗后船舶</span>
+                        <span class="stat-value stat-ok" id="statShipsClean">0</span>
+                    </div>
+                </div>
+                <button id="btnDownload" class="btn btn-outline btn-full mt16">
+                    ⬇️ 下载清洗后的 CSV
+                </button>
+            </div>
+
+            <div class="panel">
+                <h2>显示选项</h2>
+                <div class="checkbox-group">
+                    <label><input type="checkbox" id="showHeatmap" checked> 密度热力图</label>
+                    <label><input type="checkbox" id="showTrajectories" checked> 航线轨迹</label>
+                    <label><input type="checkbox" id="showScatter"> 船舶散点</label>
+                </div>
+                <div class="form-group mt16">
+                    <label>热力图维度:</label>
+                    <select id="heatmapDimension">
+                        <option value="point_count">轨迹点密度</option>
+                        <option value="ship_count">船舶数量</option>
+                        <option value="avg_speed">平均航速</option>
+                    </select>
+                </div>
+            </div>
+        </aside>
+
+        <section class="content">
+            <div id="mainChart" class="chart-container"></div>
+
+            <div class="info-cards">
+                <div class="info-card">
+                    <h3>📋 数据范围</h3>
+                    <div id="infoRange" class="info-content">—</div>
+                </div>
+                <div class="info-card">
+                    <h3>🗺️ 海域格子</h3>
+                    <div id="infoGrid" class="info-content">—</div>
+                </div>
+                <div class="info-card">
+                    <h3>⚓ 航道情况</h3>
+                    <div id="infoTraffic" class="info-content">—</div>
+                </div>
+            </div>
+
+            <div class="panel ships-panel hidden" id="shipsPanel">
+                <h2>🚢 船舶列表</h2>
+                <div class="ships-table-container">
+                    <table class="ships-table">
+                        <thead>
+                            <tr>
+                                <th>船呼号</th>
+                                <th>轨迹点数</th>
+                                <th>纬度范围</th>
+                                <th>经度范围</th>
+                                <th>平均航速(节)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="shipsTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="loadingOverlay" class="loading-overlay hidden">
+        <div class="loading-spinner"></div>
+        <p id="loadingText">处理中...</p>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
